@@ -1,3 +1,7 @@
+import sys
+# Force unbuffered output
+sys.stdout.reconfigure(line_buffering=True)
+
 import gc
 import cv2
 import os
@@ -15,7 +19,18 @@ from dependency.DepthCrafter.depthcrafter.depth_crafter_ppl import DepthCrafterP
 from dependency.DepthCrafter.depthcrafter.unet import DiffusersUNetSpatioTemporalConditionModelDepthCrafter
 from dependency.DepthCrafter.depthcrafter.utils import vis_sequence_depth
 
-from Forward_Warp import forward_warp
+def read_video_frames_chunked(vid, frames_idx, chunk_size=500):
+    """
+    Load video frames in chunks to avoid 32-bit index overflow.
+    For videos with T*H*W*C > 2^31 elements, loading all at once fails.
+    """
+    chunks = []
+    for start in range(0, len(frames_idx), chunk_size):
+        end = min(start + chunk_size, len(frames_idx))
+        chunk_indices = frames_idx[start:end]
+        chunk = vid.get_batch(chunk_indices).asnumpy().astype("float32") / 255.0
+        chunks.append(chunk)
+    return np.concatenate(chunks, axis=0)
 
 
 def read_video_frames(video_path, process_length, target_fps, max_res, dataset="open"):
@@ -48,7 +63,9 @@ def read_video_frames(video_path, process_length, target_fps, max_res, dataset="
     print(
         f"==> final processing shape: {len(frames_idx), *vid.get_batch([0]).shape[1:]}"
     )
-    frames = vid.get_batch(frames_idx).asnumpy().astype("float32") / 255.0
+
+    # Use chunked loading to avoid 32-bit index overflow on long/high-res videos
+    frames = read_video_frames_chunked(vid, frames_idx, chunk_size=500)
 
     return frames, fps, original_height, original_width
 
@@ -84,13 +101,23 @@ class DepthCrafterDemo:
                 raise ValueError(f"Unknown cpu offload option: {cpu_offload}")
         else:
             self.pipe.to("cuda")
-        # enable attention slicing and xformers memory efficient attention
+        # Enable Flash Attention via PyTorch SDPA (2.9+) and AttnProcessor2_0
+        # This replaces the slow attention slicing fallback
         try:
-            self.pipe.enable_xformers_memory_efficient_attention()
+            from diffusers.models.attention_processor import AttnProcessor2_0
+            self.pipe.unet.set_attn_processor(AttnProcessor2_0())
+            print(f"Flash Attention enabled via AttnProcessor2_0 (SDPA backend)")
         except Exception as e:
-            print(e)
-            print("Xformers is not enabled")
-        self.pipe.enable_attention_slicing()
+            print(f"AttnProcessor2_0 not available: {e}, falling back to default attention")
+
+        # Enable VAE optimizations for memory efficiency (if available)
+        if hasattr(self.pipe, 'enable_vae_slicing'):
+            self.pipe.enable_vae_slicing()
+        if hasattr(self.pipe, 'enable_vae_tiling'):
+            self.pipe.enable_vae_tiling()
+
+        # NOTE: torch.compile disabled for DepthCrafter - custom UNet causes CUDA graph conflicts
+        # The inpainting stage still uses torch.compile for speedup
 
     def infer(
         self,
@@ -119,6 +146,7 @@ class DepthCrafterDemo:
         )
 
         # inference the depth map using the DepthCrafter pipeline
+        print("==> Starting depth inference...")
         with torch.inference_mode():
             res = self.pipe(
                 frames,
@@ -131,19 +159,24 @@ class DepthCrafterDemo:
                 overlap=overlap,
                 track_time=track_time,
             ).frames[0]
+        print("==> Depth inference done, post-processing...")
 
         # convert the three-channel output to a single channel depth map
         res = res.sum(-1) / res.shape[-1]
+        print("==> Converted to single channel")
 
         # resize the depth to the original size
         tensor_res = torch.tensor(res).unsqueeze(1).float().contiguous().cuda()
         res = F.interpolate(tensor_res, size=(original_height, original_width), mode='bilinear', align_corners=False)
         res = res.cpu().numpy()[:,0,:,:]
-        
+        print("==> Resized to original size")
+
         # normalize the depth map to [0, 1] across the whole video
         res = (res - res.min()) / (res.max() - res.min())
+        print("==> Normalized depth map")
         # visualize the depth map and save the results
         vis = vis_sequence_depth(res)
+        print("==> Visualization complete")
         # save the depth map and visualization with the target FPS
         save_path = os.path.join(
             os.path.dirname(output_video_path), os.path.splitext(os.path.basename(output_video_path))[0]
@@ -158,41 +191,120 @@ class DepthCrafterDemo:
     
 
 class ForwardWarpStereo(nn.Module):
+    """
+    Pure PyTorch stereo warping using forward splatting.
+    Replaces the CUDA Forward_Warp dependency for better compatibility.
+    """
     def __init__(self, eps=1e-6, occlu_map=False):
         super(ForwardWarpStereo, self).__init__()
         self.eps = eps
         self.occlu_map = occlu_map
-        self.fw = forward_warp()
+
+    def forward_warp_splat(self, img, flow):
+        """
+        Forward warp using splatting (scatter-add operation).
+
+        Args:
+            img: [B, C, H, W] source image
+            flow: [B, H, W, 2] optical flow (dx, dy)
+
+        Returns:
+            warped: [B, C, H, W] forward-warped image
+        """
+        B, C, H, W = img.shape
+        device = img.device
+        dtype = img.dtype
+
+        # Create base coordinate grid
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(H, device=device, dtype=dtype),
+            torch.arange(W, device=device, dtype=dtype),
+            indexing='ij'
+        )
+        grid_x = grid_x.unsqueeze(0).expand(B, -1, -1)  # [B, H, W]
+        grid_y = grid_y.unsqueeze(0).expand(B, -1, -1)  # [B, H, W]
+
+        # Compute target coordinates
+        target_x = grid_x + flow[..., 0]  # [B, H, W]
+        target_y = grid_y + flow[..., 1]  # [B, H, W]
+
+        # Bilinear splatting - distribute each source pixel to 4 neighbors
+        x0 = torch.floor(target_x).long()
+        x1 = x0 + 1
+        y0 = torch.floor(target_y).long()
+        y1 = y0 + 1
+
+        # Compute bilinear weights
+        wa = (x1.float() - target_x) * (y1.float() - target_y)
+        wb = (x1.float() - target_x) * (target_y - y0.float())
+        wc = (target_x - x0.float()) * (y1.float() - target_y)
+        wd = (target_x - x0.float()) * (target_y - y0.float())
+
+        # Initialize output
+        output = torch.zeros_like(img)
+        weight_sum = torch.zeros(B, 1, H, W, device=device, dtype=dtype)
+
+        # Flatten for scatter_add
+        img_flat = img.permute(0, 2, 3, 1).reshape(B, H * W, C)  # [B, H*W, C]
+
+        for dx, dy, w in [(x0, y0, wa), (x0, y1, wb), (x1, y0, wc), (x1, y1, wd)]:
+            # Clamp coordinates and create valid mask
+            valid = (dx >= 0) & (dx < W) & (dy >= 0) & (dy < H)
+            dx_clamped = dx.clamp(0, W - 1)
+            dy_clamped = dy.clamp(0, H - 1)
+
+            # Compute linear indices
+            indices = (dy_clamped * W + dx_clamped).view(B, H * W)  # [B, H*W]
+
+            # Apply validity mask to weights
+            w_masked = w.view(B, H * W, 1) * valid.view(B, H * W, 1).float()  # [B, H*W, 1]
+
+            # Scatter-add weighted pixels
+            weighted_img = img_flat * w_masked  # [B, H*W, C]
+
+            for b in range(B):
+                output[b] = output[b].view(C, H * W).scatter_add(
+                    1, indices[b:b+1].expand(C, -1), weighted_img[b].t()
+                ).view(C, H, W)
+                weight_sum[b, 0] = weight_sum[b, 0].view(H * W).scatter_add(
+                    0, indices[b], w_masked[b, :, 0]
+                ).view(H, W)
+
+        return output, weight_sum
 
     def forward(self, im, disp):
         """
         :param im: BCHW
-        :param disp: B1HW
-        :return: BCHW
-        detach will lead to unconverge!!
+        :param disp: B1HW disparity map
+        :return: BCHW warped image, optionally B1HW occlusion mask
         """
         im = im.contiguous()
         disp = disp.contiguous()
-        # weights_map = torch.abs(disp)
+
+        # Compute depth-based weights (closer = higher weight)
         weights_map = disp - disp.min()
-        weights_map = (
-            1.414
-        ) ** weights_map  # using 1.414 instead of EXP for avoding numerical overflow.
-        flow = -disp.squeeze(1)
-        dummy_flow = torch.zeros_like(flow, requires_grad=False)
-        flow = torch.stack((flow, dummy_flow), dim=-1)
-        res_accum = self.fw(im * weights_map, flow)
-        # mask = self.fw(weights_map, flow.detach())
-        mask = self.fw(weights_map, flow)
-        mask.clamp_(min=self.eps)
+        weights_map = (1.414) ** weights_map  # Avoid exp overflow
+
+        # Create flow from disparity (horizontal shift only)
+        flow_x = -disp.squeeze(1)  # [B, H, W]
+        flow_y = torch.zeros_like(flow_x)
+        flow = torch.stack((flow_x, flow_y), dim=-1)  # [B, H, W, 2]
+
+        # Forward warp weighted image and weights
+        res_accum, _ = self.forward_warp_splat(im * weights_map, flow)
+        mask, _ = self.forward_warp_splat(weights_map, flow)
+
+        # Normalize by accumulated weights
+        mask = mask.clamp(min=self.eps)
         res = res_accum / mask
+
         if not self.occlu_map:
             return res
         else:
-            ones = torch.ones_like(disp, requires_grad=False)
-            occlu_map = self.fw(ones, flow)
-            occlu_map.clamp_(0.0, 1.0)
-            occlu_map = 1.0 - occlu_map
+            # Compute occlusion map (areas with no coverage)
+            ones = torch.ones_like(disp)
+            coverage, _ = self.forward_warp_splat(ones, flow)
+            occlu_map = 1.0 - coverage.clamp(0.0, 1.0)
             return res, occlu_map
         
 
@@ -216,7 +328,9 @@ def DepthSplatting(
     '''
     vid_reader = VideoReader(input_video_path, ctx=cpu(0))
     original_fps = vid_reader.get_avg_fps()
-    input_frames = vid_reader[:].asnumpy() / 255.0
+    # Use chunked loading to avoid 32-bit index overflow
+    frame_indices = list(range(len(vid_reader)))
+    input_frames = read_video_frames_chunked(vid_reader, frame_indices, chunk_size=500)
 
     if process_length != -1 and process_length < len(input_frames):
         input_frames = input_frames[:process_length]
@@ -236,7 +350,9 @@ def DepthSplatting(
         (width * 2, height * 2)
     )
 
-    for i in range(0, num_frames, batch_size):
+    total_batches = (num_frames + batch_size - 1) // batch_size
+    for batch_idx, i in enumerate(range(0, num_frames, batch_size)):
+        print(f"    Processing batch {batch_idx + 1}/{total_batches}...", end='\r')
         batch_frames = input_frames[i:i+batch_size]
         batch_depth = video_depth[i:i+batch_size]
         batch_depth_vis = depth_vis[i:i+batch_size]
@@ -267,7 +383,9 @@ def DepthSplatting(
         torch.cuda.empty_cache()
         gc.collect()
 
+    print()  # newline after progress
     out.release()
+    print(f"    Video written: {output_video_path}")
 
 
 def main(
@@ -289,16 +407,19 @@ def main(
         output_video_path,
         process_length
     )
+    print(f"==> Depth estimation complete. Shape: {video_depth.shape}")
 
+    print("==> Starting stereo splatting...")
     DepthSplatting(
-        input_video_path, 
-        output_video_path, 
-        video_depth, 
+        input_video_path,
+        output_video_path,
+        video_depth,
         depth_vis,
         max_disp,
-        process_length, 
+        process_length,
         batch_size
     )
+    print(f"==> Splatting complete. Output saved to: {output_video_path}")
 
 
 if __name__ == "__main__":

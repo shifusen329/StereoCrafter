@@ -1,0 +1,64 @@
+[project]
+name = "stereocrafter"
+version = "0.1.0"
+description = "Diffusion-based stereoscopic 3D video generation from monocular video"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # Core PyTorch
+    "torch>=2.9.0",
+    "torchvision>=0.24.0",
+
+    # Diffusion pipeline
+    "diffusers>=0.31.0",
+    "transformers>=4.45.0",
+    "accelerate>=1.2.0",
+    "safetensors>=0.4.0",
+
+    # Attention utilities
+    "einops>=0.8.0",
+    # NOTE: flash-attn must be installed separately after pytorch:
+    # pip install flash-attn --no-build-isolation
+
+    # Video I/O
+    "decord>=0.6.0",
+    "av>=12.0.0",
+    "opencv-python>=4.10.0",
+
+    # Image processing
+    "numpy<2.0",
+    "pillow>=10.0.0",
+    "matplotlib>=3.7.0",
+    "mediapy>=1.2.0",
+    "imageio>=2.30.0",
+
+    # Utilities
+    "fire>=0.5.0",
+    "tqdm>=4.65.0",
+    "huggingface-hub>=0.20.0",
+
+    # Build tools
+    "setuptools>=70.0.0",
+    "wheel>=0.43.0",
+]
+
+[project.optional-dependencies]
+# OpenEXR export for depth maps
+exr = [
+    "OpenEXR>=3.2.0",
+]
+# Visualization tools
+viz = [
+    "viser>=0.1.0",
+    "tyro>=0.5.0",
+]
+# Gradio demo app
+demo = [
+    "gradio>=4.0.0",
+    "spaces>=0.19.0",
+]
+# All optional dependencies
+all = [
+    "stereocrafter[exr,viz,demo]",
+]
+

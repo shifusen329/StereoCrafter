@@ -6,6 +6,66 @@ from fire import Fire
 import torch
 from decord import VideoReader, cpu
 
+
+def match_colors_lab(source, reference):
+    """
+    Match source image colors to reference image using LAB color space.
+    This ensures the right eye (inpainted) matches the left eye (original) colors.
+
+    Args:
+        source: numpy array [H, W, 3] in BGR format, uint8
+        reference: numpy array [H, W, 3] in BGR format, uint8
+
+    Returns:
+        matched: numpy array [H, W, 3] in BGR format, uint8
+    """
+    # Convert to LAB color space
+    src_lab = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype(np.float32)
+    ref_lab = cv2.cvtColor(reference, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    # Match mean and std for each channel
+    for i in range(3):
+        src_mean, src_std = src_lab[:, :, i].mean(), src_lab[:, :, i].std() + 1e-6
+        ref_mean, ref_std = ref_lab[:, :, i].mean(), ref_lab[:, :, i].std() + 1e-6
+        src_lab[:, :, i] = (src_lab[:, :, i] - src_mean) * (ref_std / src_std) + ref_mean
+
+    # Clip to valid range and convert back
+    src_lab = np.clip(src_lab, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(src_lab, cv2.COLOR_LAB2BGR)
+
+
+def match_colors_batch(frames_output, frames_reference):
+    """
+    Apply LAB color matching to a batch of frames.
+
+    Args:
+        frames_output: torch tensor [T, C, H, W] in [0, 1] RGB
+        frames_reference: torch tensor [T, C, H, W] in [0, 1] RGB
+
+    Returns:
+        matched: torch tensor [T, C, H, W] in [0, 1] RGB
+    """
+    T = frames_output.shape[0]
+    matched_frames = []
+
+    for t in range(T):
+        # Convert to numpy BGR uint8
+        src = (frames_output[t].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        src = cv2.cvtColor(src, cv2.COLOR_RGB2BGR)
+
+        ref = (frames_reference[t].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        ref = cv2.cvtColor(ref, cv2.COLOR_RGB2BGR)
+
+        # Match colors
+        matched = match_colors_lab(src, ref)
+
+        # Convert back to RGB tensor
+        matched = cv2.cvtColor(matched, cv2.COLOR_BGR2RGB)
+        matched = torch.tensor(matched, dtype=torch.float32).permute(2, 0, 1) / 255.0
+        matched_frames.append(matched)
+
+    return torch.stack(matched_frames)
+
 from transformers import CLIPVisionModelWithProjection
 from diffusers import (
     AutoencoderKLTemporalDecoder,
@@ -184,18 +244,46 @@ def main(
     )
     pipeline = pipeline.to("cuda")
 
+    # Enable Flash Attention via PyTorch SDPA (2.9+) and AttnProcessor2_0
+    try:
+        from diffusers.models.attention_processor import AttnProcessor2_0
+        pipeline.unet.set_attn_processor(AttnProcessor2_0())
+        print("Flash Attention enabled via AttnProcessor2_0 (SDPA backend)")
+    except Exception as e:
+        print(f"AttnProcessor2_0 not available: {e}, falling back to default attention")
+
+    # Enable VAE optimizations for memory efficiency
+    pipeline.enable_vae_slicing()
+    pipeline.enable_vae_tiling()
+
+    # Compile UNet for faster inference (20-40% speedup)
+    try:
+        pipeline.unet = torch.compile(pipeline.unet, mode="reduce-overhead")
+        print("torch.compile enabled for UNet (reduce-overhead mode)")
+    except Exception as e:
+        print(f"torch.compile not available: {e}")
+
     os.makedirs(save_dir, exist_ok=True)
     video_name = input_video_path.split("/")[-1].replace(".mp4", "").replace("_splatting_results", "") + "_inpainting_results"
 
     video_reader = VideoReader(input_video_path, ctx=cpu(0))
     fps = video_reader.get_avg_fps()
-    frame_indices = list(range(len(video_reader)))
-    frames = video_reader.get_batch(frame_indices)
     num_frames = len(video_reader)
+
+    # Use chunked loading to avoid 32-bit index overflow on long/high-res videos
+    frame_indices = list(range(num_frames))
+    chunks = []
+    chunk_size = 500
+    for start in range(0, len(frame_indices), chunk_size):
+        end = min(start + chunk_size, len(frame_indices))
+        chunk_indices = frame_indices[start:end]
+        chunk = video_reader.get_batch(chunk_indices).asnumpy()
+        chunks.append(chunk)
+    frames = np.concatenate(chunks, axis=0)
 
     # [t,h,w,c] -> [t,c,h,w]
     frames = (
-        torch.tensor(frames.asnumpy()).permute(0, 3, 1, 2).float()
+        torch.tensor(frames).permute(0, 3, 1, 2).float()
     )  
 
     height, width = frames.shape[2] // 2, frames.shape[3] // 2
@@ -255,7 +343,7 @@ def main(
         )
 
         video_latents = video_latents.unsqueeze(0)
-        if video_latents == torch.float16:
+        if video_latents.dtype == torch.float16:
             pipeline.vae.to(dtype=torch.float16)
 
         video_frames = pipeline.decode_latents(video_latents, num_frames=video_latents.shape[1], decode_chunk_size=2)
@@ -274,6 +362,9 @@ def main(
 
     frames_output = torch.cat(results, dim=0).cpu()
 
+    # Apply LAB color matching to fix left/right eye color inconsistency
+    print("Applying LAB color matching...")
+    frames_output = match_colors_batch(frames_output, frames_left)
 
     frames_sbs = torch.cat([frames_left, frames_output], dim=3)
     frames_sbs_path = os.path.join(save_dir, f"{video_name}_sbs.mp4")
