@@ -253,8 +253,10 @@ def main(
         print(f"AttnProcessor2_0 not available: {e}, falling back to default attention")
 
     # Enable VAE optimizations for memory efficiency
-    pipeline.enable_vae_slicing()
-    pipeline.enable_vae_tiling()
+    if hasattr(pipeline, 'enable_vae_slicing'):
+        pipeline.enable_vae_slicing()
+    if hasattr(pipeline, 'enable_vae_tiling'):
+        pipeline.enable_vae_tiling()
 
     # Compile UNet for faster inference (20-40% speedup)
     try:
